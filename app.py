@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import time
 from typing import List, Optional
 
 import streamlit as st
@@ -31,6 +32,9 @@ except ImportError:  # package missing on the server
 # Configuration
 # --------------------------------------------------------------------------- #
 DEFAULT_MODEL = "gemini-3.6-flash"  # override with the GEMINI_MODEL secret / env var
+# Tried in order if the main model is overloaded (503) or not found (404).
+FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3-flash-preview"]
+RETRIES_PER_MODEL = 3  # attempts per model, with exponential backoff (2s, 4s)
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 30_000
 MAX_JD_CHARS = 10_000
@@ -174,6 +178,40 @@ def _clamp(value: int) -> int:
     return max(0, min(100, int(value)))
 
 
+def _error_code(exc: Exception) -> Optional[int]:
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    text = str(exc)
+    for c in (429, 500, 502, 503, 504, 404, 400, 401, 403):
+        if text.startswith(str(c)) or f"'code': {c}" in text:
+            return c
+    return None
+
+
+def _generate_with_retry(client, model, contents, config, sleep=time.sleep):
+    """Call Gemini, retrying busy errors and falling back to other models."""
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_exc: Optional[Exception] = None
+    for m in models:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                return client.models.generate_content(model=m, contents=contents, config=config)
+            except Exception as exc:  # noqa: BLE001 - SDK raises several error types
+                last_exc = exc
+                code = _error_code(exc)
+                if code in (400, 401, 403):  # bad key / bad request: retrying won't help
+                    raise
+                if code == 404:  # model name not available: go to the next model
+                    break
+                if attempt < RETRIES_PER_MODEL - 1:  # busy/rate-limited: wait, retry
+                    sleep(2 ** (attempt + 1))
+    raise RuntimeError(
+        "Google's Gemini service is busy right now (high demand). "
+        "Please wait a minute and click Analyze again."
+    ) from last_exc
+
+
 def analyze_resume(
     api_key: str,
     model: str,
@@ -181,6 +219,7 @@ def analyze_resume(
     job_description: Optional[str] = None,
     client: Optional[genai.Client] = None,
     file_part: Optional[tuple] = None,
+    sleep=time.sleep,
 ) -> ATSResult:
     """Call Gemini and return a validated ATSResult.
 
@@ -194,16 +233,13 @@ def analyze_resume(
         contents = [types.Part.from_bytes(data=data, mime_type=mime), prompt]
     else:
         contents = prompt
-    response = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            response_schema=ATSResult,
-            temperature=0.2,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=ATSResult,
+        temperature=0.2,
     )
+    response = _generate_with_retry(client, model, contents, config, sleep)
 
     raw = response.text
     if not raw:
